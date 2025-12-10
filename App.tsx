@@ -309,7 +309,7 @@ const InstallPWA: React.FC = () => {
                                 </div>
                                 <div className="flex items-center gap-3">
                                     <span className="bg-blue-500 text-white w-6 h-6 rounded-full flex items-center justify-center font-bold text-xs shrink-0 shadow-sm">2</span>
-                                    <span className="text-sm font-bold text-slate-700">Nhấn Menu <Menu size={14} className="inline ml-1"/> -> <b>Cài đặt ứng dụng / Thêm vào màn hình chính</b></span>
+                                    <span className="text-sm font-bold text-slate-700">Nhấn Menu <Menu size={14} className="inline ml-1"/> &rarr; <b>Cài đặt ứng dụng / Thêm vào màn hình chính</b></span>
                                 </div>
                             </div>
 
