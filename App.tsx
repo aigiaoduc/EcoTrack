@@ -5,7 +5,7 @@ import {
   Settings, LogOut, Database, Search, ShieldCheck,
   CheckCircle2, Sparkles, Pencil, UserCog, AlertTriangle, Layers, X,
   Calendar, Clock, FileDown, CalendarX, Download, Eraser, Eye, ChevronLeft, ChevronRight, Check,
-  TrendingUp, PieChart as PieChartIcon, Filter, Quote, AlertCircle, Info, Lock, KeyRound, DownloadCloud, Share, Menu
+  TrendingUp, PieChart as PieChartIcon, Filter, Quote, AlertCircle, Info, Lock, KeyRound, DownloadCloud, Share, Menu, WifiOff
 } from 'lucide-react';
 import { 
   TransportType, WasteType, DeviceType, DailyLog, StudentProfile, 
@@ -15,7 +15,7 @@ import {
   saveDailyLog, getStudentLogs, 
   loginByStudentId, updateStudentProfile, getAllStudentsData, seedStudentAccounts,
   deleteStudent, deleteAllStudents, exportLogsToCSV, 
-  deleteLogsByDateRange, deleteAllLogs
+  deleteLogsByDateRange, deleteAllLogs, getIsOfflineMode
 } from './services/storageService';
 import { generateEcoInsight, getRandomWelcomeQuote } from './services/geminiService';
 import InputSection from './components/InputSection';
@@ -51,6 +51,19 @@ const ToastContainer: React.FC<{ toasts: {id: string, message: string, type: 'su
                     <span className="font-bold text-sm">{t.message}</span>
                 </div>
             ))}
+        </div>
+    );
+};
+
+const OfflineIndicator: React.FC = () => {
+    // Check offline status from service
+    const isOffline = getIsOfflineMode();
+    if (!isOffline) return null;
+
+    return (
+        <div className="bg-slate-800 text-white text-xs font-bold py-1 px-3 text-center flex items-center justify-center gap-2 relative z-[100]">
+            <WifiOff size={14} className="text-red-400" />
+            <span>Chế độ Offline (Chưa kết nối Cloud) - Dữ liệu chỉ lưu trên máy này.</span>
         </div>
     );
 };
@@ -324,7 +337,17 @@ const InstallPWA: React.FC = () => {
     );
 };
 
-// --- Sub-components for Screens ---
+// ... (Rest of the components remain same until App export)
+// We just need to make sure the OfflineIndicator is placed inside App
+
+// ... (Keep WelcomeScreen, SeedModal, DeleteDataModal, StudentHistoryModal, ProfileEditModal, CalculatorScreen, TeacherScreen EXACTLY AS IS)
+
+// For brevity, I am not re-pasting the sub-components unless they changed.
+// I will just export the updated App component which includes the OfflineIndicator.
+
+// BUT, since the user asked to FIX the app, I must output the FULL FILE CONTENT for the changed file to be safe and correct.
+
+// ... Let's just output the whole file content for App.tsx to ensure OfflineIndicator is integrated correctly.
 
 const WelcomeScreen: React.FC<{ 
   onStudentLogin: (profile: StudentProfile) => void,
@@ -452,9 +475,6 @@ const WelcomeScreen: React.FC<{
     </div>
   );
 };
-
-// ... (Rest of the file remains unchanged from previous versions, CalculatorScreen, TeacherScreen etc.)
-// ... (Including SeedModal, DeleteDataModal, StudentHistoryModal, ProfileEditModal)
 
 const SeedModal: React.FC<{
     isOpen: boolean,
@@ -1804,6 +1824,7 @@ export default function App() {
 
   return (
     <>
+      <OfflineIndicator />
       <ToastContainer toasts={toasts} />
       {showCelebration && <CelebrationOverlay onDismiss={() => setShowCelebration(false)} />}
       

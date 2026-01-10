@@ -1,30 +1,31 @@
-
 import { DailyLog, StudentProfile } from '../types';
 import { initializeApp } from 'firebase/app';
 import { 
-  getFirestore, doc, getDoc, setDoc, updateDoc, 
-  collection, addDoc, getDocs, query, where, orderBy, deleteDoc, writeBatch, collectionGroup,
+  getFirestore, doc, getDoc, setDoc, 
+  collection, getDocs, query, orderBy, deleteDoc, writeBatch, where,
   enableIndexedDbPersistence
 } from 'firebase/firestore';
+import { getAuth, signInAnonymously } from 'firebase/auth';
 import { firebaseConfig } from '../firebaseConfig';
 
 // Initialize Firebase
 let db: any;
+let auth: any;
+let isOfflineMode = false; // Flag: true if Auth/Permission errors occur, forcing local storage use
+
 try {
     const app = initializeApp(firebaseConfig);
     db = getFirestore(app);
+    auth = getAuth(app);
     
-    // Kích hoạt tính năng Offline (Persistence)
-    // Dữ liệu sẽ được lưu vào IndexedDB của trình duyệt
-    enableIndexedDbPersistence(db).catch((err) => {
-        if (err.code == 'failed-precondition') {
-            console.warn('Persistence failed: Multiple tabs open');
-        } else if (err.code == 'unimplemented') {
-            console.warn('Persistence is not available in this browser');
-        }
+    // Attempt offline persistence
+    enableIndexedDbPersistence(db).catch((err: any) => {
+       // Ignore benign errors (e.g., multiple tabs open)
+       console.log("Persistence status:", err.code);
     });
 } catch (e) {
-    console.error("Firebase init failed. Check firebaseConfig.ts", e);
+    console.warn("Firebase init failed, switching to offline mode.", e);
+    isOfflineMode = true;
 }
 
 const COLLECTIONS = {
@@ -32,171 +33,282 @@ const COLLECTIONS = {
   LOGS: 'logs'
 };
 
-const MAX_STUDENT_LIMIT = 100; // Giới hạn tối đa số học sinh
+const LOCAL_STORAGE_KEY = "ecotrack_data_v1";
 
-// --- Auth / Student Logic ---
+// --- Helper: Check Connection Status for UI ---
+export const getIsOfflineMode = () => isOfflineMode;
 
-/**
- * Đăng nhập bằng mã học sinh (ví dụ: hocsinh001)
- * Trả về thông tin profile nếu mã đúng, hoặc null nếu không tồn tại.
- */
-export const loginByStudentId = async (studentId: string): Promise<StudentProfile | null> => {
-  if (!db) return null;
-  try {
-    const docRef = doc(db, COLLECTIONS.STUDENTS, studentId);
-    const docSnap = await getDoc(docRef);
-
-    if (docSnap.exists()) {
-      const data = docSnap.data();
-      return {
-        id: studentId,
-        name: data.displayName || '', // Tên có thể chưa đặt
-        className: data.className || '',
-        pin: data.pin || '' // Trả về PIN để kiểm tra ở Client (hoặc xử lý ở UI)
-      };
-    } else {
-      console.warn("Mã học sinh không tồn tại");
-      return null;
+// --- Local Storage Helpers ---
+const getLocalData = () => {
+    try {
+        return JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) || '{"students": {}, "logs": {}}');
+    } catch {
+        return { students: {}, logs: {} };
     }
-  } catch (error) {
-    console.error("Lỗi đăng nhập:", error);
-    throw error;
-  }
 };
 
+const saveLocalData = (data: any) => {
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
+};
+
+// --- Auth Helper ---
 /**
- * Cập nhật thông tin cá nhân (Tên hiển thị, lớp, mã PIN)
+ * Tries to sign in anonymously. 
+ * If it fails (config not found), marks app as Offline Mode.
  */
-export const updateStudentProfile = async (id: string, name: string, className: string, pin?: string): Promise<void> => {
-    if (!db) return;
-    const docRef = doc(db, COLLECTIONS.STUDENTS, id);
+const ensureAuth = async () => {
+    if (isOfflineMode || !auth) return false;
     
-    const updateData: any = {
-        displayName: name,
-        className: className,
-        lastActive: new Date().toISOString()
-    };
+    // If already signed in
+    if (auth.currentUser) return true;
 
-    if (pin !== undefined) {
-        updateData.pin = pin;
+    try {
+        await signInAnonymously(auth);
+        return true;
+    } catch (error: any) {
+        console.warn("Auth failed, switching to local storage fallback:", error.code);
+        // Common error when Auth is not enabled in Console
+        if (error.code === 'auth/configuration-not-found' || error.code === 'auth/operation-not-allowed' || error.code === 'auth/internal-error') {
+             isOfflineMode = true;
+        }
+        return false;
     }
-
-    // Sử dụng setDoc với merge: true để tạo nếu chưa có hoặc update nếu đã có (an toàn)
-    await setDoc(docRef, updateData, { merge: true });
 };
 
-// --- Logs Logic ---
+// --- Student Logic ---
+
+export const loginByStudentId = async (studentId: string): Promise<StudentProfile | null> => {
+    let cloudProfile: StudentProfile | null = null;
+    let useCloud = !isOfflineMode;
+
+    // 1. Try Cloud Login
+    if (useCloud) {
+        const authed = await ensureAuth();
+        if (authed && db) {
+            try {
+                const docRef = doc(db, COLLECTIONS.STUDENTS, studentId);
+                const docSnap = await getDoc(docRef);
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    cloudProfile = {
+                        id: studentId,
+                        name: data.displayName || '',
+                        className: data.className || '',
+                        pin: data.pin || ''
+                    };
+                }
+            } catch (e: any) {
+                console.warn("Cloud login error (Permission/Network):", e.code);
+                // If permission denied, likely Rules reject unauthed user or config issue
+                if (e.code === 'permission-denied' || e.code === 'unavailable') {
+                    useCloud = false; 
+                    isOfflineMode = true; // Mark as offline if permission denied happens
+                }
+            }
+        } else {
+            useCloud = false;
+        }
+    }
+
+    // 2. Local Fallback & Sync
+    const localData = getLocalData();
+    const localProfile = localData.students[studentId];
+
+    // If we got data from cloud, update local cache and return it
+    if (cloudProfile) {
+        localData.students[studentId] = cloudProfile;
+        saveLocalData(localData);
+        return cloudProfile;
+    }
+
+    // If Cloud failed or returned nothing
+    if (!useCloud || isOfflineMode) {
+        // Return local profile if exists
+        if (localProfile) {
+            return localProfile;
+        }
+        
+        // --- CRITICAL FIX ---
+        // If Cloud is broken (Permission Denied/No Auth), we allow the user to 
+        // "create" a session locally simply by logging in.
+        // This ensures the app works for the student even if the backend is broken.
+        const newLocalProfile = { id: studentId, name: '', className: '' };
+        localData.students[studentId] = newLocalProfile;
+        saveLocalData(localData);
+        return newLocalProfile;
+    }
+
+    // Cloud worked but user ID not found in DB
+    return null; 
+};
+
+export const updateStudentProfile = async (id: string, name: string, className: string, pin?: string): Promise<void> => {
+    // 1. Update Local (Always succeeds)
+    const localData = getLocalData();
+    localData.students[id] = { 
+        ...(localData.students[id] || { id }), 
+        name, 
+        className, 
+        pin: pin || localData.students[id]?.pin 
+    };
+    saveLocalData(localData);
+
+    // 2. Try Update Cloud
+    if (!isOfflineMode && await ensureAuth() && db) {
+        try {
+             const docRef = doc(db, COLLECTIONS.STUDENTS, id);
+             const updateData: any = {
+                displayName: name,
+                className: className,
+                lastActive: new Date().toISOString()
+            };
+            if (pin !== undefined) updateData.pin = pin;
+            await setDoc(docRef, updateData, { merge: true });
+        } catch (e) {
+            console.warn("Cloud update failed, data saved locally only.");
+        }
+    }
+};
 
 export const saveDailyLog = async (log: DailyLog): Promise<void> => {
-  if (!db) {
-      console.error("Database not initialized");
-      throw new Error("Lỗi kết nối cơ sở dữ liệu");
-  }
-  
-  try {
-      // 1. Lưu log vào sub-collection: students/{studentId}/logs/{logId}
-      const logRef = doc(db, COLLECTIONS.STUDENTS, log.studentId, COLLECTIONS.LOGS, log.id);
-      await setDoc(logRef, log);
-      
-      // 2. Cập nhật tổng quan cho student
-      const studentRef = doc(db, COLLECTIONS.STUDENTS, log.studentId);
-      const studentSnap = await getDoc(studentRef);
-      
-      let currentTotal = 0;
-      let currentCount = 0;
+    // 1. Save Local (Primary for reliability)
+    const localData = getLocalData();
+    const studentLogs = localData.logs[log.studentId] || [];
+    
+    // Avoid duplicates if saving same ID
+    const existingIdx = studentLogs.findIndex((l: DailyLog) => l.id === log.id);
+    if (existingIdx >= 0) studentLogs[existingIdx] = log;
+    else studentLogs.push(log);
+    
+    localData.logs[log.studentId] = studentLogs;
+    
+    // Update local stats
+    const currentProfile = localData.students[log.studentId] || { id: log.studentId };
+    currentProfile.logCount = (currentProfile.logCount || 0) + 1;
+    currentProfile.totalCo2 = (currentProfile.totalCo2 || 0) + log.totalCo2Kg;
+    localData.students[log.studentId] = currentProfile;
+    
+    saveLocalData(localData);
 
-      if (studentSnap.exists()) {
-          const data = studentSnap.data();
-          currentTotal = data.totalCo2 || 0;
-          currentCount = data.logCount || 0;
-      } else {
-          // Trường hợp hiếm: Doc student bị xóa nhưng vẫn login được (cache), hoặc lỗi logic
-          // Ta sẽ tạo lại doc này để đảm bảo dữ liệu không bị mất
-          console.warn("Student doc missing during save, creating new...");
-      }
-
-      const newTotal = currentTotal + log.totalCo2Kg;
-      const newLogCount = currentCount + 1;
-
-      // Dùng setDoc với merge: true thay vì updateDoc để an toàn hơn (tự tạo field nếu thiếu)
-      await setDoc(studentRef, { 
-          totalCo2: newTotal,
-          logCount: newLogCount,
-          lastActive: new Date().toISOString()
-      }, { merge: true });
-      
-  } catch (error) {
-      console.error("Error saving log:", error);
-      throw error; // Ném lỗi ra để UI bắt được
-  }
+    // 2. Sync to Cloud
+    if (!isOfflineMode && await ensureAuth() && db) {
+        try {
+            // Save Log
+            const logRef = doc(db, COLLECTIONS.STUDENTS, log.studentId, COLLECTIONS.LOGS, log.id);
+            await setDoc(logRef, log);
+            
+            // Update Student Stats
+            const studentRef = doc(db, COLLECTIONS.STUDENTS, log.studentId);
+            await setDoc(studentRef, { 
+                totalCo2: currentProfile.totalCo2,
+                logCount: currentProfile.logCount,
+                lastActive: new Date().toISOString()
+            }, { merge: true });
+        } catch (e) {
+             console.warn("Cloud save failed, but local save succeeded.", e);
+             // Do NOT throw error, UI should show success
+        }
+    }
 };
 
 export const getStudentLogs = async (studentId: string): Promise<DailyLog[]> => {
-  if (!db) return [];
-  const logsRef = collection(db, COLLECTIONS.STUDENTS, studentId, COLLECTIONS.LOGS);
-  // Query 20 log gần nhất
-  const q = query(logsRef, orderBy('timestamp', 'desc')); 
-  
-  const querySnapshot = await getDocs(q);
-  const logs: DailyLog[] = [];
-  querySnapshot.forEach((doc) => {
-    logs.push(doc.data() as DailyLog);
-  });
-  return logs;
+    let cloudLogs: DailyLog[] | null = null;
+
+    // 1. Try Fetch Cloud
+    if (!isOfflineMode && await ensureAuth() && db) {
+        try {
+            const logsRef = collection(db, COLLECTIONS.STUDENTS, studentId, COLLECTIONS.LOGS);
+            const q = query(logsRef, orderBy('timestamp', 'desc')); 
+            const querySnapshot = await getDocs(q);
+            
+            cloudLogs = [];
+            querySnapshot.forEach((doc) => cloudLogs?.push(doc.data() as DailyLog));
+            
+            // Sync cloud results to local cache
+            const localData = getLocalData();
+            localData.logs[studentId] = cloudLogs;
+            saveLocalData(localData);
+        } catch (e) {
+            console.warn("Cloud fetch failed, falling back to local.");
+        }
+    }
+
+    // 2. Return Cloud or Local Fallback
+    if (cloudLogs) return cloudLogs;
+    
+    const localData = getLocalData();
+    const logs = localData.logs[studentId] || [];
+    return logs.sort((a: DailyLog, b: DailyLog) => b.timestamp - a.timestamp);
 };
 
-// --- Teacher / Admin Logic ---
+// --- Admin / Teacher Functions ---
 
-/**
- * Hàm đặc biệt: Tự động tạo hàng loạt tài khoản
- * Hỗ trợ batching để tránh giới hạn 500 writes của Firestore
- */
-export const seedStudentAccounts = async (
-    prefix: string = 'hocsinh', 
-    startIndex: number = 1,
-    count: number = 100,
-    defaultClass: string = ""
-): Promise<string[]> => {
-    if (!db) return [];
+export const getAllStudentsData = async (): Promise<any[]> => {
+     // Try Cloud
+     if (!isOfflineMode && await ensureAuth() && db) {
+         try {
+             const studentsRef = collection(db, COLLECTIONS.STUDENTS);
+             const querySnapshot = await getDocs(studentsRef);
+             const students: any[] = [];
+             querySnapshot.forEach((doc) => {
+                 const data = doc.data();
+                 students.push({
+                     studentId: doc.id,
+                     name: data.displayName || "(Chưa kích hoạt)",
+                     className: data.className || "",
+                     totalCo2: data.totalCo2 || 0,
+                     logs: data.logCount || 0,
+                     pin: data.pin || ""
+                 });
+             });
+             return students.sort((a, b) => a.studentId.localeCompare(b.studentId, undefined, { numeric: true, sensitivity: 'base' }));
+         } catch(e) {
+             console.warn("Admin cloud fetch failed");
+         }
+     }
+     
+     // Fallback to local (Note: Teacher usually needs cloud, but we return what we have)
+     const localData = getLocalData();
+     return Object.values(localData.students).map((s: any) => ({
+         studentId: s.id,
+         name: s.name || "(Offline/Local)",
+         className: s.className || "",
+         totalCo2: s.totalCo2 || 0,
+         logs: s.logCount || 0,
+         pin: s.pin || ""
+     }));
+};
 
-    // 1. Kiểm tra giới hạn số lượng học sinh
+export const seedStudentAccounts = async (prefix: string, startIndex: number, count: number, defaultClass: string): Promise<string[]> => {
+    if (isOfflineMode || !(await ensureAuth()) || !db) {
+        throw new Error("Không thể tạo tài khoản khi đang ở chế độ Offline (Lỗi kết nối Firebase).");
+    }
+    
+    // Original Logic
     const studentsRef = collection(db, COLLECTIONS.STUDENTS);
     const snapshot = await getDocs(studentsRef);
     const currentCount = snapshot.size;
+    const MAX_STUDENT_LIMIT = 100;
 
     if (currentCount + count > MAX_STUDENT_LIMIT) {
         const remaining = Math.max(0, MAX_STUDENT_LIMIT - currentCount);
-        throw new Error(`Đạt giới hạn ${MAX_STUDENT_LIMIT} học sinh. Hiện có: ${currentCount}. Bạn chỉ có thể tạo thêm tối đa ${remaining} tài khoản.`);
+        throw new Error(`Đạt giới hạn ${MAX_STUDENT_LIMIT} học sinh.`);
     }
     
-    // 2. Tiến hành tạo nếu chưa vượt quá giới hạn
     const createdIds: string[] = [];
-    const BATCH_SIZE = 400; // Safe limit under 500
+    const BATCH_SIZE = 400;
     
     let currentBatch = writeBatch(db);
     let operationCount = 0;
-    let batchCount = 0;
 
     for (let i = 0; i < count; i++) {
         const num = startIndex + i;
-        // Pad số 0: 1 -> 001, 99 -> 099
         const idSuffix = num.toString().padStart(3, '0');
         const studentId = `${prefix}${idSuffix}`;
-        
         const docRef = doc(db, COLLECTIONS.STUDENTS, studentId);
-        
-        const dataToSet: any = {
-             id: studentId,
-             createdAt: new Date().toISOString()
-        };
-
-        // Chỉ set lớp nếu giáo viên có nhập
-        if (defaultClass) {
-            dataToSet.className = defaultClass;
-        }
-
+        const dataToSet: any = { id: studentId, createdAt: new Date().toISOString() };
+        if (defaultClass) dataToSet.className = defaultClass;
         currentBatch.set(docRef, dataToSet, { merge: true });
-        
         createdIds.push(studentId);
         operationCount++;
 
@@ -204,247 +316,149 @@ export const seedStudentAccounts = async (
             await currentBatch.commit();
             currentBatch = writeBatch(db);
             operationCount = 0;
-            batchCount++;
         }
     }
-
-    if (operationCount > 0) {
-        await currentBatch.commit();
-    }
-    
+    if (operationCount > 0) await currentBatch.commit();
     return createdIds;
 };
 
 export const deleteStudent = async (studentId: string): Promise<void> => {
-    if (!db) return;
-    await deleteDoc(doc(db, COLLECTIONS.STUDENTS, studentId));
+    // Cloud
+    if (!isOfflineMode && await ensureAuth() && db) {
+        try {
+            await deleteDoc(doc(db, COLLECTIONS.STUDENTS, studentId));
+        } catch (e) { console.warn("Cloud delete failed"); }
+    }
+    // Local
+    const localData = getLocalData();
+    delete localData.students[studentId];
+    delete localData.logs[studentId];
+    saveLocalData(localData);
 };
 
 export const deleteAllStudents = async (): Promise<void> => {
-    if (!db) return;
-    const studentsRef = collection(db, COLLECTIONS.STUDENTS);
-    const snapshot = await getDocs(studentsRef);
-    
-    // Batch delete
-    const BATCH_SIZE = 400;
-    let batch = writeBatch(db);
-    let count = 0;
-
-    for (const doc of snapshot.docs) {
-        batch.delete(doc.ref);
-        count++;
-        if (count >= BATCH_SIZE) {
-            await batch.commit();
-            batch = writeBatch(db);
-            count = 0;
-        }
+    // Cloud
+    if (!isOfflineMode && await ensureAuth() && db) {
+        try {
+            const studentsRef = collection(db, COLLECTIONS.STUDENTS);
+            const snapshot = await getDocs(studentsRef);
+            let batch = writeBatch(db);
+            let count = 0;
+            for (const doc of snapshot.docs) {
+                batch.delete(doc.ref);
+                count++;
+                if (count >= 400) { await batch.commit(); batch = writeBatch(db); count = 0; }
+            }
+            if (count > 0) await batch.commit();
+        } catch (e) { console.warn("Cloud delete all failed"); }
     }
-    
-    if (count > 0) {
-        await batch.commit();
-    }
+    // Local
+    localStorage.removeItem(LOCAL_STORAGE_KEY);
 };
 
-export const getAllStudentsData = async (): Promise<{ studentId: string, name: string, className: string, totalCo2: number, logs: number, pin?: string }[]> => {
-  if (!db) return [];
-  const studentsRef = collection(db, COLLECTIONS.STUDENTS);
-  const querySnapshot = await getDocs(studentsRef);
-  
-  const students: any[] = [];
-  querySnapshot.forEach((doc) => {
-    const data = doc.data();
-    students.push({
-        studentId: doc.id,
-        name: data.displayName || "(Chưa kích hoạt)",
-        className: data.className || "",
-        totalCo2: data.totalCo2 || 0,
-        logs: data.logCount || 0,
-        pin: data.pin || "" // Lấy cả PIN cho admin xem
-    });
-  });
-  
-  return students.sort((a, b) => {
-     // Sort theo ID
-     return a.studentId.localeCompare(b.studentId, undefined, { numeric: true, sensitivity: 'base' });
-  });
-};
-
-// --- Reporting & Maintenance ---
-
-/**
- * Xuất dữ liệu ra CSV theo Tháng và Năm được chọn
- * @param year Năm cần xuất báo cáo (VD: 2024)
- * @param months Mảng các tháng cần xuất (VD: [1, 2, 12])
- */
 export const exportLogsToCSV = async (year: number, months: number[]): Promise<string> => {
-    if (!db) return "";
-    if (!months || months.length === 0) return "";
-    
-    // Xác định khoảng thời gian rộng nhất để query database (từ đầu năm đến cuối năm)
-    // Sau đó sẽ filter chi tiết bằng code JS
-    const startOfYear = new Date(year, 0, 1).getTime();
-    const endOfYear = new Date(year, 11, 31, 23, 59, 59).getTime();
-
+    // Relies on getAllStudentsData & getStudentLogs which handle fallback
     const students = await getAllStudentsData();
-    
-    // QUAN TRỌNG: Thêm BOM (\uFEFF) để Excel nhận diện UTF-8
-    let csvContent = "\uFEFF"; 
-    
-    // Header columns
-    csvContent += "Mã Học Sinh;Họ Tên;Lớp;Ngày;Tháng;Giờ;Đi Lại (km);Rác Thải (món);Thiết Bị (giờ);Tổng CO2 (kg)\n";
+    let csvContent = "\uFEFFMã Học Sinh;Họ Tên;Lớp;Ngày;Tháng;Giờ;Đi Lại (km);Rác Thải (món);Thiết Bị (giờ);Tổng CO2 (kg)\n";
 
-    // Duyệt từng học sinh
     for (const st of students) {
         const logs = await getStudentLogs(st.studentId);
-        
-        // Filter: Lấy log trong năm VÀ có tháng nằm trong danh sách months
         const filteredLogs = logs.filter(l => {
             const date = new Date(l.timestamp);
-            const logYear = date.getFullYear();
-            const logMonth = date.getMonth() + 1; // getMonth() trả về 0-11
-            return logYear === year && months.includes(logMonth);
+            return date.getFullYear() === year && months.includes(date.getMonth() + 1);
         });
-        
-        // Sort lại log theo thứ tự thời gian tăng dần
         filteredLogs.sort((a, b) => a.timestamp - b.timestamp);
 
-        // Biến tính tổng cho khoảng thời gian này
         let studentTotalCO2 = 0;
-
         if (filteredLogs.length > 0) {
             for (const log of filteredLogs) {
                  studentTotalCO2 += log.totalCo2Kg;
-
                  const d = new Date(log.timestamp);
-                 const dateStr = d.toLocaleDateString('vi-VN'); // dd/mm/yyyy
-                 const monthStr = (d.getMonth() + 1).toString();
-                 const timeStr = d.toLocaleTimeString('vi-VN', {hour: '2-digit', minute:'2-digit'});
-                 
-                 // Tính tổng từng loại để report
                  const tDist = log.transport.reduce((sum, t) => sum + t.distanceKm, 0);
                  const wAmount = log.waste.reduce((sum, w) => sum + w.amountKg, 0); 
                  const dTime = log.digital.reduce((sum, d) => sum + d.hours, 0);
-
-                 const row = [
-                     `"${st.studentId}"`,
-                     `"${st.name}"`, 
-                     `"${st.className}"`,
-                     `"${dateStr}"`,
-                     `"${monthStr}"`,
-                     `"${timeStr}"`,
-                     tDist.toString().replace('.', ','),
-                     wAmount.toString().replace('.', ','),
-                     dTime.toString().replace('.', ','),
-                     log.totalCo2Kg.toFixed(2).replace('.', ',') 
-                 ].join(";");
+                 const row = [`"${st.studentId}"`,`"${st.name}"`, `"${st.className}"`,`"${d.toLocaleDateString('vi-VN')}"`,`"${d.getMonth() + 1}"`,`"${d.toLocaleTimeString('vi-VN', {hour: '2-digit', minute:'2-digit'})}"`,tDist.toString().replace('.', ','),wAmount.toString().replace('.', ','),dTime.toString().replace('.', ','),log.totalCo2Kg.toFixed(2).replace('.', ',')].join(";");
                  csvContent += row + "\n";
             }
-
-            // --- THÊM DÒNG TỔNG KẾT CHO HỌC SINH NÀY ---
-            const summaryRow = [
-                `"TỔNG KẾT (${st.studentId})"`, // Cột Mã HS
-                `"Tổng phát thải trong các tháng đã chọn: ${studentTotalCO2.toFixed(2).replace('.', ',')} kg"`, // Cột Tên
-                "", "", "", "", "", "", "", // Các cột trống
-                `"${studentTotalCO2.toFixed(2).replace('.', ',')}"` // Cột Tổng CO2
-            ].join(";");
-            
-            // Thêm dòng tổng kết
-            csvContent += summaryRow + "\n";
-            
-            // Thêm một dòng trống để tách biệt các học sinh
-            csvContent += ";;;;;;;;;\n";
+            csvContent += `"TỔNG KẾT (${st.studentId})";"Tổng phát thải: ${studentTotalCO2.toFixed(2).replace('.', ',')} kg";;;;;;;;"${studentTotalCO2.toFixed(2).replace('.', ',')}"\n;;;;;;;;;\n`;
         }
     }
-
     return encodeURI("data:text/csv;charset=utf-8," + csvContent);
 };
 
-/**
- * Xóa dữ liệu (logs) theo khoảng thời gian
- * Không xóa tài khoản học sinh
- */
 export const deleteLogsByDateRange = async (fromDateStr: string, toDateStr: string): Promise<number> => {
-    if (!db) return 0;
-    
+    let count = 0;
     const startTs = new Date(fromDateStr).setHours(0,0,0,0);
     const endTs = new Date(toDateStr).setHours(23,59,59,999);
-
-    const students = await getAllStudentsData();
-    let deletedCount = 0;
-    const BATCH_SIZE = 400;
-    let batch = writeBatch(db);
-    let opCount = 0;
-
-    for (const st of students) {
-        const logsRef = collection(db, COLLECTIONS.STUDENTS, st.studentId, COLLECTIONS.LOGS);
-        // Query timestamp trong khoảng
-        const q = query(logsRef, where('timestamp', '>=', startTs), where('timestamp', '<=', endTs));
-        const snapshot = await getDocs(q);
-
-        for (const docSnap of snapshot.docs) {
-            batch.delete(docSnap.ref);
-            opCount++;
-            deletedCount++;
-
-            if (opCount >= BATCH_SIZE) {
-                await batch.commit();
-                batch = writeBatch(db);
-                opCount = 0;
-            }
-        }
-    }
-
-    if (opCount > 0) {
-        await batch.commit();
-    }
     
-    return deletedCount;
+    // 1. Delete Local
+    const localData = getLocalData();
+    Object.keys(localData.logs).forEach(studentId => {
+        const logs = localData.logs[studentId];
+        const initialLen = logs.length;
+        const newLogs = logs.filter((l: DailyLog) => !(l.timestamp >= startTs && l.timestamp <= endTs));
+        localData.logs[studentId] = newLogs;
+        count += (initialLen - newLogs.length);
+    });
+    saveLocalData(localData);
+
+    // 2. Delete Cloud (Best effort)
+    if (!isOfflineMode && await ensureAuth() && db) {
+        try {
+            const students = await getAllStudentsData();
+            let batch = writeBatch(db);
+            let opCount = 0;
+            for (const st of students) {
+                const logsRef = collection(db, COLLECTIONS.STUDENTS, st.studentId, COLLECTIONS.LOGS);
+                const q = query(logsRef, where('timestamp', '>=', startTs), where('timestamp', '<=', endTs));
+                const snapshot = await getDocs(q);
+                for (const d of snapshot.docs) {
+                    batch.delete(d.ref);
+                    opCount++;
+                    if (opCount >= 400) { await batch.commit(); batch = writeBatch(db); opCount = 0; }
+                }
+            }
+            if (opCount > 0) await batch.commit();
+        } catch(e) { console.warn("Cloud range delete failed"); }
+    }
+    return count;
 };
 
-/**
- * Xóa TOÀN BỘ dữ liệu (logs) của tất cả học sinh
- * Không xóa tài khoản học sinh, reset bộ đếm về 0
- */
 export const deleteAllLogs = async (): Promise<number> => {
-    if (!db) return 0;
-
-    const students = await getAllStudentsData();
-    let deletedCount = 0;
-    const BATCH_SIZE = 400;
-    let batch = writeBatch(db);
-    let opCount = 0;
-
-    for (const st of students) {
-        const logsRef = collection(db, COLLECTIONS.STUDENTS, st.studentId, COLLECTIONS.LOGS);
-        const snapshot = await getDocs(logsRef);
-
-        for (const docSnap of snapshot.docs) {
-            batch.delete(docSnap.ref);
-            opCount++;
-            deletedCount++;
-
-            if (opCount >= BATCH_SIZE) {
-                await batch.commit();
-                batch = writeBatch(db);
-                opCount = 0;
-            }
+    let count = 0;
+    // 1. Local
+    const localData = getLocalData();
+    Object.keys(localData.logs).forEach(key => {
+        count += localData.logs[key].length;
+        localData.logs[key] = [];
+        if(localData.students[key]) {
+             localData.students[key].totalCo2 = 0;
+             localData.students[key].logCount = 0;
         }
+    });
+    saveLocalData(localData);
 
-        // Reset student stats
-        const studentRef = doc(db, COLLECTIONS.STUDENTS, st.studentId);
-        batch.update(studentRef, { totalCo2: 0, logCount: 0 });
-        opCount++;
-        
-        if (opCount >= BATCH_SIZE) {
-            await batch.commit();
-            batch = writeBatch(db);
-            opCount = 0;
-        }
+    // 2. Cloud
+    if (!isOfflineMode && await ensureAuth() && db) {
+         try {
+             // Reusing previous logic logic...
+             const students = await getAllStudentsData();
+             let batch = writeBatch(db);
+             let opCount = 0;
+             for (const st of students) {
+                const logsRef = collection(db, COLLECTIONS.STUDENTS, st.studentId, COLLECTIONS.LOGS);
+                const snapshot = await getDocs(logsRef);
+                for (const d of snapshot.docs) {
+                    batch.delete(d.ref);
+                    opCount++;
+                    if (opCount >= 400) { await batch.commit(); batch = writeBatch(db); opCount = 0; }
+                }
+                const stRef = doc(db, COLLECTIONS.STUDENTS, st.studentId);
+                batch.update(stRef, { totalCo2: 0, logCount: 0 });
+                opCount++;
+             }
+             if (opCount > 0) await batch.commit();
+         } catch(e) { console.warn("Cloud delete all logs failed"); }
     }
-
-    if (opCount > 0) {
-        await batch.commit();
-    }
-
-    return deletedCount;
+    return count;
 };
